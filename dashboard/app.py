@@ -1,6 +1,6 @@
 """
 AI Intrusion Response System — Upgraded Streamlit Dashboard
-Includes: Explainability, Threat Intelligence, Attack Map, Report Generator
+Includes: Explainability, Threat Intelligence, Attack Map, Report Generator, SQL Injection Detection
 Run: streamlit run dashboard/app.py
 """
 
@@ -8,6 +8,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import re
 import time
 import pandas as pd
 import streamlit as st
@@ -38,6 +39,61 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ── SQL Injection Detection Engine ──
+SQL_INJECTION_PATTERNS = [
+    (r"\b(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|EXEC|UNION|TRUNCATE|REPLACE)\b", "SQL Keyword"),
+    (r"(--|#|/\*|\*/|;--)", "SQL Comment / Terminator"),
+    (r"('\s*(OR|AND)\s*'[\s\d=])", "OR/AND Bypass"),
+    (r"(\bOR\b\s+[\w'\"]+\s*=\s*[\w'\"]+)", "Always-True Condition"),
+    (r"(1\s*=\s*1|'1'\s*=\s*'1'|1\s*=\s*'1')", "Tautology (1=1)"),
+    (r"(;\s*(DROP|DELETE|INSERT|UPDATE|CREATE)\b)", "Chained Query"),
+    (r"\b(SLEEP\s*\(|BENCHMARK\s*\(|WAITFOR\s+DELAY|PG_SLEEP\s*\()", "Time-Based Blind Injection"),
+    (r"\b(xp_cmdshell|sp_executesql|OPENROWSET|BULK\s+INSERT)\b", "Stored Procedure / MSSQL Attack"),
+    (r"(CHAR\s*\(\d+\)|CONCAT\s*\(|GROUP_CONCAT\s*\()", "Encoding / Obfuscation"),
+    (r"(INFORMATION_SCHEMA|SYS\.TABLES|SYSOBJECTS|PG_TABLES)", "Schema Enumeration"),
+    (r"(LOAD_FILE\s*\(|INTO\s+OUTFILE|INTO\s+DUMPFILE)", "File Read/Write Attempt"),
+    (r"(\bUNION\b.{0,30}\bSELECT\b)", "UNION SELECT Attack"),
+]
+
+def detect_sql_injection(payload: str) -> dict:
+    if not payload or not payload.strip():
+        return {"detected": False, "risk": "None", "matches": [], "categories": []}
+
+    matches = []
+    categories = []
+    for pattern, category in SQL_INJECTION_PATTERNS:
+        found = re.findall(pattern, payload, re.IGNORECASE)
+        if found:
+            matches.extend([str(f) for f in found])
+            if category not in categories:
+                categories.append(category)
+
+    unique_matches = list(dict.fromkeys(matches))
+
+    if len(categories) >= 3:
+        risk = "Critical"
+    elif len(categories) == 2:
+        risk = "High"
+    elif len(categories) == 1:
+        risk = "Medium"
+    else:
+        risk = "None"
+
+    return {
+        "detected": len(categories) > 0,
+        "risk": risk,
+        "matches": unique_matches,
+        "categories": categories,
+        "payload": payload,
+    }
+
+def scan_batch_payloads(payloads: list) -> list:
+    results = []
+    for p in payloads:
+        r = detect_sql_injection(p)
+        results.append({**r, "payload": p})
+    return results
+
 # ── Session state ──
 def _init_state():
     defaults = {
@@ -50,6 +106,7 @@ def _init_state():
         "phishing_metrics": None, "phishing_best_model": None,
         "traffic_mode": "mixed", "total_processed": 0,
         "total_anomalies": 0, "total_blocked": 0,
+        "sqli_history": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -82,7 +139,8 @@ with st.sidebar:
         for key in ["log_buffer","result_buffer","explain_buffer","ts_buffer"]:
             st.session_state[key].clear()
         st.session_state.update({"running":False,"total_processed":0,
-                                  "total_anomalies":0,"total_blocked":0})
+                                  "total_anomalies":0,"total_blocked":0,
+                                  "sqli_history":[]})
         st.rerun()
     st.markdown("---")
     st.markdown("### 📥 Export Report")
@@ -123,7 +181,6 @@ if not st.session_state["initialized"]:
                 "best_model": init_result["best_model"],
                 "metrics_df": pd.DataFrame(init_result["metrics"]),
             })
-            # Train phishing detector
             phishing = PhishingDetector()
             phishing_metrics = phishing.train()
             st.session_state["phishing_detector"] = phishing
@@ -199,10 +256,10 @@ k4.metric("IPs Blocked", f"{n_blocked}")
 k5.metric("Detection Rate", detection_rate)
 st.markdown("---")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 Live Monitor", "🧠 AI Explainability",
     "🌍 Attack Map & Intel", "🤖 Model Benchmark",
-    "🎣 Phishing URL Scanner"
+    "🎣 Phishing URL Scanner", "💉 SQL Injection Detector"
 ])
 
 # ════════ TAB 1 — Live Monitor ════════
@@ -473,7 +530,6 @@ with tab5:
     if detector is None:
         st.warning("Phishing detector not initialized. Please restart the app.")
     else:
-        # ── URL Input ──
         st.markdown("#### 🔍 Scan a URL")
         col_input, col_btn = st.columns([4, 1])
         url_input = col_input.text_input(
@@ -483,7 +539,6 @@ with tab5:
         )
         scan_clicked = col_btn.button("🔍 Scan", type="primary", use_container_width=True)
 
-        # ── Bulk test URLs ──
         with st.expander("🧪 Try example URLs"):
             ex_col1, ex_col2 = st.columns(2)
             with ex_col1:
@@ -505,22 +560,13 @@ with tab5:
                 for u in phish_examples:
                     st.code(u, language=None)
 
-        # ── Scan result ──
         if scan_clicked and url_input.strip():
             url = url_input.strip()
             with st.spinner("Analyzing URL..."):
                 result = detector.analyze(url)
 
-            verdict_colors = {
-                "SAFE": "#2ecc71",
-                "SUSPICIOUS": "#e67e22",
-                "PHISHING": "#e74c3c"
-            }
-            verdict_icons = {
-                "SAFE": "✅",
-                "SUSPICIOUS": "⚠️",
-                "PHISHING": "🚨"
-            }
+            verdict_colors = {"SAFE": "#2ecc71", "SUSPICIOUS": "#e67e22", "PHISHING": "#e74c3c"}
+            verdict_icons = {"SAFE": "✅", "SUSPICIOUS": "⚠️", "PHISHING": "🚨"}
             color = verdict_colors[result.verdict]
             icon = verdict_icons[result.verdict]
 
@@ -538,12 +584,10 @@ with tab5:
             st.markdown("---")
 
             col_rules, col_feat = st.columns([1, 1])
-
             with col_rules:
                 st.markdown("#### 🔎 Rule-Based Analysis")
                 for rule in result.triggered_rules:
                     st.markdown(f"- {rule}")
-
                 st.markdown("#### 🤖 ML Model Used")
                 st.info(f"**{result.model_used}** — trained on 1,200 labeled URLs")
 
@@ -555,19 +599,13 @@ with tab5:
                     x=feat_vals, y=feat_names, orientation="h",
                     marker_color=["#e74c3c" if v > 5 else "#e67e22" if v > 2 else "#3498db"
                                   for v in feat_vals],
-                    text=[f"{v:.1f}" for v in feat_vals],
-                    textposition="outside",
+                    text=[f"{v:.1f}" for v in feat_vals], textposition="outside",
                 ))
-                fig_feat.update_layout(
-                    template="plotly_dark", height=220,
-                    margin=dict(l=0, r=40, t=10, b=0),
-                    yaxis=dict(autorange="reversed"),
-                )
+                fig_feat.update_layout(template="plotly_dark", height=220,
+                    margin=dict(l=0, r=40, t=10, b=0), yaxis=dict(autorange="reversed"))
                 st.plotly_chart(fig_feat, use_container_width=True)
 
         st.markdown("---")
-
-        # ── Scan History ──
         history = detector.get_history()
         if history:
             st.markdown("#### 🕐 Scan History")
@@ -587,7 +625,6 @@ with tab5:
                 hide_index=True, use_container_width=True, height=250,
             )
 
-            # Stats
             st.markdown("#### 📈 Detection Statistics")
             total_scanned = len(history)
             phishing_count = sum(1 for r in history if r.verdict == "PHISHING")
@@ -600,23 +637,17 @@ with tab5:
             s3.metric("⚠️ Suspicious", suspicious_count)
             s4.metric("✅ Safe", safe_count)
 
-            # Pie chart
             if total_scanned > 0:
                 fig_pie = go.Figure(go.Pie(
                     labels=["SAFE", "SUSPICIOUS", "PHISHING"],
                     values=[safe_count, suspicious_count, phishing_count],
-                    marker_colors=["#2ecc71", "#e67e22", "#e74c3c"],
-                    hole=0.4,
+                    marker_colors=["#2ecc71", "#e67e22", "#e74c3c"], hole=0.4,
                 ))
-                fig_pie.update_layout(
-                    template="plotly_dark", height=280,
-                    margin=dict(l=0, r=0, t=10, b=0),
-                )
+                fig_pie.update_layout(template="plotly_dark", height=280,
+                    margin=dict(l=0, r=0, t=10, b=0))
                 st.plotly_chart(fig_pie, use_container_width=True)
 
         st.markdown("---")
-
-        # ── Model Benchmark ──
         st.markdown("#### 🤖 Phishing ML Model Benchmark")
         phishing_metrics = st.session_state.get("phishing_metrics")
         best_phish = st.session_state.get("phishing_best_model")
@@ -654,7 +685,291 @@ The **Rule layer** applies 8 specific phishing heuristics with weighted scores.
 The **Hybrid score** = 60% ML + 40% Rules → final verdict.
 """)
 
+# ════════ TAB 6 — SQL Injection Detector ════════
+with tab6:
+    st.markdown("### 💉 SQL Injection Detection")
+    st.markdown("*Pattern-based + heuristic engine — detects malicious SQL payloads in real time*")
+
+    sqli_tab1, sqli_tab2, sqli_tab3 = st.tabs(["🔍 Single Payload", "📋 Batch Scanner", "📊 History & Stats"])
+
+    # ── Single Payload ──
+    with sqli_tab1:
+        st.markdown("#### Enter a payload to analyze")
+        sqli_input = st.text_area(
+            "Payload",
+            placeholder="e.g.  ' OR '1'='1 --   |   UNION SELECT * FROM users   |   normal search",
+            height=100,
+            label_visibility="collapsed",
+        )
+
+        with st.expander("🧪 Try example payloads"):
+            ex1, ex2 = st.columns(2)
+            with ex1:
+                st.markdown("**Malicious:**")
+                st.code("' OR '1'='1' --")
+                st.code("1; DROP TABLE users;")
+                st.code("UNION SELECT username, password FROM users")
+                st.code("admin'--")
+                st.code("1' AND SLEEP(5)--")
+            with ex2:
+                st.markdown("**Safe:**")
+                st.code("john.doe@email.com")
+                st.code("SELECT a product from our range")
+                st.code("normal search query")
+                st.code("hello world")
+
+        sqli_scan = st.button("🔍 Analyze Payload", type="primary")
+
+        if sqli_scan and sqli_input.strip():
+            result = detect_sql_injection(sqli_input.strip())
+
+            risk_color = {
+                "Critical": "#e74c3c",
+                "High": "#e67e22",
+                "Medium": "#f1c40f",
+                "None": "#2ecc71",
+            }.get(result["risk"], "#aaa")
+
+            risk_icon = {
+                "Critical": "🚨",
+                "High": "⚠️",
+                "Medium": "🔶",
+                "None": "✅",
+            }.get(result["risk"], "❓")
+
+            st.markdown("---")
+            if result["detected"]:
+                st.markdown(
+                    f"## {risk_icon} <span style='color:{risk_color}'>SQL Injection Detected — Risk: {result['risk']}</span>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown("## ✅ <span style='color:#2ecc71'>No SQL Injection Detected — Payload is Safe</span>",
+                            unsafe_allow_html=True)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Detection", "🚨 DETECTED" if result["detected"] else "✅ CLEAN")
+            m2.metric("Risk Level", result["risk"])
+            m3.metric("Attack Categories", len(result["categories"]))
+
+            if result["detected"]:
+                st.markdown("---")
+                col_cat, col_match = st.columns([1, 1])
+
+                with col_cat:
+                    st.markdown("#### 🏷️ Attack Categories Matched")
+                    for cat in result["categories"]:
+                        st.error(f"🔴 {cat}")
+
+                with col_match:
+                    st.markdown("#### 🔎 Matched Patterns")
+                    for m in result["matches"][:10]:
+                        st.code(m)
+
+                # Bar chart of categories
+                st.markdown("#### 📊 Category Severity Weights")
+                severity_map = {
+                    "SQL Keyword": 3,
+                    "SQL Comment / Terminator": 4,
+                    "OR/AND Bypass": 7,
+                    "Always-True Condition": 8,
+                    "Tautology (1=1)": 8,
+                    "Chained Query": 9,
+                    "Time-Based Blind Injection": 10,
+                    "Stored Procedure / MSSQL Attack": 10,
+                    "Encoding / Obfuscation": 6,
+                    "Schema Enumeration": 7,
+                    "File Read/Write Attempt": 10,
+                    "UNION SELECT Attack": 9,
+                }
+                cat_scores = [(c, severity_map.get(c, 5)) for c in result["categories"]]
+                df_cat = pd.DataFrame(cat_scores, columns=["Category", "Severity"])
+                fig_cat = go.Figure(go.Bar(
+                    x=df_cat["Severity"], y=df_cat["Category"], orientation="h",
+                    marker_color=["#e74c3c" if s >= 8 else "#e67e22" if s >= 5 else "#f1c40f"
+                                  for s in df_cat["Severity"]],
+                    text=df_cat["Severity"], textposition="outside",
+                ))
+                fig_cat.update_layout(
+                    template="plotly_dark", height=max(150, len(cat_scores) * 50),
+                    margin=dict(l=0, r=40, t=10, b=0),
+                    xaxis=dict(range=[0, 11], title="Severity Score (1–10)"),
+                    yaxis=dict(autorange="reversed"),
+                )
+                st.plotly_chart(fig_cat, use_container_width=True)
+
+            # Save to history
+            st.session_state["sqli_history"].append({
+                "payload": sqli_input.strip()[:80],
+                "detected": result["detected"],
+                "risk": result["risk"],
+                "categories": ", ".join(result["categories"]) if result["categories"] else "None",
+                "match_count": len(result["matches"]),
+            })
+
+    # ── Batch Scanner ──
+    with sqli_tab2:
+        st.markdown("#### Paste multiple payloads (one per line)")
+        batch_input = st.text_area(
+            "Batch payloads",
+            value="' OR '1'='1' --\nSELECT * FROM users\nnormal search query\n1; DROP TABLE logs;\nUNION SELECT username,password FROM admin\nhello world\n1' AND SLEEP(5)--\nlegitimate@email.com",
+            height=200,
+            label_visibility="collapsed",
+        )
+        batch_scan = st.button("🔍 Scan All Payloads", type="primary")
+
+        if batch_scan and batch_input.strip():
+            payloads = [p.strip() for p in batch_input.strip().split("\n") if p.strip()]
+            results = scan_batch_payloads(payloads)
+
+            total_p = len(results)
+            detected_p = sum(1 for r in results if r["detected"])
+            clean_p = total_p - detected_p
+            critical_p = sum(1 for r in results if r["risk"] == "Critical")
+
+            st.markdown("---")
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("Total Scanned", total_p)
+            b2.metric("🚨 Malicious", detected_p)
+            b3.metric("✅ Clean", clean_p)
+            b4.metric("💀 Critical", critical_p)
+
+            st.markdown("#### 📋 Scan Results")
+            df_batch = pd.DataFrame([{
+                "Payload": r["payload"][:60] + ("..." if len(r["payload"]) > 60 else ""),
+                "Detected": "🚨 YES" if r["detected"] else "✅ NO",
+                "Risk": r["risk"],
+                "Categories": ", ".join(r["categories"]) if r["categories"] else "—",
+                "Matches": len(r["matches"]),
+            } for r in results])
+
+            def _color_risk(val):
+                return {
+                    "Critical": "color:#e74c3c;font-weight:bold",
+                    "High": "color:#e67e22;font-weight:bold",
+                    "Medium": "color:#f1c40f",
+                    "None": "color:#2ecc71",
+                }.get(val, "")
+
+            st.dataframe(df_batch.style.map(_color_risk, subset=["Risk"]),
+                         hide_index=True, use_container_width=True)
+
+            if detected_p > 0:
+                st.markdown("#### 🔴 Detected Injections Only")
+                for r in results:
+                    if r["detected"]:
+                        risk_color = {"Critical":"#e74c3c","High":"#e67e22","Medium":"#f1c40f"}.get(r["risk"],"#aaa")
+                        st.markdown(
+                            f"<div style='border-left:4px solid {risk_color};padding:8px 12px;"
+                            f"margin:6px 0;background:#1e2130;border-radius:4px'>"
+                            f"<b style='color:{risk_color}'>[{r['risk']}]</b> "
+                            f"<code>{r['payload'][:80]}</code><br>"
+                            f"<small style='color:#888'>Categories: {', '.join(r['categories'])}</small>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+            # Add to history
+            for r in results:
+                st.session_state["sqli_history"].append({
+                    "payload": r["payload"][:80],
+                    "detected": r["detected"],
+                    "risk": r["risk"],
+                    "categories": ", ".join(r["categories"]) if r["categories"] else "None",
+                    "match_count": len(r["matches"]),
+                })
+
+    # ── History & Stats ──
+    with sqli_tab3:
+        sqli_history = st.session_state.get("sqli_history", [])
+
+        if not sqli_history:
+            st.info("No scans yet. Use the Single Payload or Batch Scanner tabs.")
+        else:
+            h_total = len(sqli_history)
+            h_detected = sum(1 for h in sqli_history if h["detected"])
+            h_clean = h_total - h_detected
+            h_critical = sum(1 for h in sqli_history if h["risk"] == "Critical")
+
+            hs1, hs2, hs3, hs4 = st.columns(4)
+            hs1.metric("Total Analyzed", h_total)
+            hs2.metric("🚨 Injections Found", h_detected)
+            hs3.metric("✅ Clean", h_clean)
+            hs4.metric("💀 Critical", h_critical)
+
+            # Pie chart
+            if h_total > 0:
+                st.markdown("#### 📊 Detection Overview")
+                cp1, cp2 = st.columns([1, 1])
+                with cp1:
+                    fig_h_pie = go.Figure(go.Pie(
+                        labels=["Clean", "Detected"],
+                        values=[h_clean, h_detected],
+                        marker_colors=["#2ecc71", "#e74c3c"],
+                        hole=0.45,
+                    ))
+                    fig_h_pie.update_layout(template="plotly_dark", height=250,
+                        margin=dict(l=0, r=0, t=10, b=0))
+                    st.plotly_chart(fig_h_pie, use_container_width=True)
+
+                with cp2:
+                    risk_counts = {"Critical": 0, "High": 0, "Medium": 0, "None": 0}
+                    for h in sqli_history:
+                        risk_counts[h["risk"]] = risk_counts.get(h["risk"], 0) + 1
+                    fig_risk = go.Figure(go.Bar(
+                        x=list(risk_counts.keys()),
+                        y=list(risk_counts.values()),
+                        marker_color=["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71"],
+                    ))
+                    fig_risk.update_layout(template="plotly_dark", height=250,
+                        margin=dict(l=0, r=0, t=10, b=0), yaxis_title="Count")
+                    st.plotly_chart(fig_risk, use_container_width=True)
+
+            st.markdown("#### 🕐 Scan History")
+            hclear, _ = st.columns([1, 4])
+            if hclear.button("🗑️ Clear SQL History"):
+                st.session_state["sqli_history"] = []
+                st.rerun()
+
+            df_hist = pd.DataFrame(sqli_history[::-1])
+            df_hist["detected"] = df_hist["detected"].map({True: "🚨 YES", False: "✅ NO"})
+
+            def _color_risk_h(val):
+                return {
+                    "Critical": "color:#e74c3c;font-weight:bold",
+                    "High": "color:#e67e22;font-weight:bold",
+                    "Medium": "color:#f1c40f",
+                    "None": "color:#2ecc71",
+                }.get(val, "")
+
+            st.dataframe(df_hist.style.map(_color_risk_h, subset=["risk"]),
+                         hide_index=True, use_container_width=True, height=300)
+
+    st.markdown("---")
+    st.markdown("""
+#### 🔬 How SQL Injection Detection Works
+
+This engine uses **12 regex patterns** across multiple attack categories:
+
+| Category | What It Catches |
+|----------|----------------|
+| **SQL Keywords** | SELECT, DROP, UNION, EXEC, etc. |
+| **Comment Injection** | `--`, `#`, `/* */` used to truncate queries |
+| **OR/AND Bypass** | Classic `' OR '1'='1` authentication bypass |
+| **Tautology** | Always-true conditions like `1=1` |
+| **Chained Queries** | `;DROP TABLE` style multi-statement attacks |
+| **Time-Based Blind** | SLEEP(), WAITFOR DELAY — used to infer data |
+| **Stored Procedures** | xp_cmdshell, sp_executesql (server takeover) |
+| **Obfuscation** | CHAR(), CONCAT() encoding to evade filters |
+| **Schema Enumeration** | INFORMATION_SCHEMA, SYS.TABLES recon |
+| **File Access** | LOAD_FILE, INTO OUTFILE — filesystem attacks |
+| **UNION SELECT** | Data extraction via combined queries |
+
+**Risk Scoring:** 1 category = Medium · 2 = High · 3+ = Critical
+""")
+
+# ── Footer ──
 st.markdown("---")
 st.markdown("<div style='text-align:center;color:#666;font-size:12px'>"
-    "AI Intrusion Response System · Explainability · Threat Intelligence · Attack Map · Phishing Detection · Excel Reports"
+    "AI Intrusion Response System · Explainability · Threat Intelligence · Attack Map · Phishing Detection · SQL Injection Detection · Excel Reports"
     "</div>", unsafe_allow_html=True)
